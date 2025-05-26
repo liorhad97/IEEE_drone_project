@@ -41,7 +41,7 @@ Estimating joystick positions:
 - **H_L_hat**: Height of left trigger/button
 - **H_R_hat**: Height of right trigger/button
 
-# we will do option 3 (:
+# we will do option 3 
 
 
 
