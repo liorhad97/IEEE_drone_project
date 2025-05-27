@@ -2,3 +2,5 @@ Flask
 torch
 einops
 torchvision
+datasets
+trl

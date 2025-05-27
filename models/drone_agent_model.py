@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-# import torch.optim as optim # Optimizer handled by RL agent
 import torchvision.models as models
 from torch.distributions import Normal
 
@@ -11,9 +10,16 @@ class DroneModel(nn.Module): # Actor-Critic Model
 
         # --- Shared Feature Extraction Backbone ---
         self.camera_vit = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT)
-        self.camera_vit.heads.head = nn.Linear(vit_model_dim, fusion_dim)
+        # Freeze parameters of the pre-trained ViT
+        # for param in self.camera_vit.parameters():
+        #     param.requires_grad = False
+        self.camera_vit.heads.head = nn.Linear(vit_model_dim, fusion_dim) # Replace the classifier head
         
         self.lidar_vit = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT)
+        # Freeze parameters of the pre-trained ViT
+        # for param in self.lidar_vit.parameters():
+        #    param.requires_grad = False
+            
         original_conv_proj = self.lidar_vit.conv_proj
         self.lidar_vit.conv_proj = nn.Conv2d(
             in_channels=1, 
@@ -26,12 +32,17 @@ class DroneModel(nn.Module): # Actor-Critic Model
             bias=(original_conv_proj.bias is not None)
         )
         if original_conv_proj.bias is not None:
-            self.lidar_vit.conv_proj.bias.data = original_conv_proj.bias.data
-        self.lidar_vit.conv_proj.weight.data = original_conv_proj.weight.data.mean(dim=1, keepdim=True)
-        self.lidar_vit.heads.head = nn.Linear(vit_model_dim, fusion_dim)
+            # Initialize bias if it exists
+            nn.init.zeros_(self.lidar_vit.conv_proj.bias)
+        # Initialize weights (example: Kaiming uniform)
+        # For the new conv layer, initialize its weights. 
+        # We are not copying mean of weights from original conv_proj, as it might not be optimal for single channel.
+        nn.init.kaiming_uniform_(self.lidar_vit.conv_proj.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
+        self.lidar_vit.heads.head = nn.Linear(vit_model_dim, fusion_dim) # Replace the classifier head
 
         self.scalar_processor = nn.Linear(scalar_input_dim, fusion_dim)
-        self.fusion_layer = nn.Linear(fusion_dim * 3, vit_model_dim)
+        # Adjusted fusion_layer input to match the sum of individual fusion_dims
+        self.fusion_layer = nn.Linear(fusion_dim * 3, vit_model_dim) # Assuming fusion_dim for each of 3 modalities
         self.relu = nn.ReLU()
 
         # --- Actor Head (Policy) ---
@@ -63,7 +74,10 @@ class DroneModel(nn.Module): # Actor-Critic Model
         scalar_inputs = torch.cat([gps, accel, gyro, teta], dim=-1).to(device)
         if scalar_inputs.ndim == 1:
             scalar_inputs = scalar_inputs.unsqueeze(0)
-
+        # If scalar_inputs was [N] (e.g. for accel which is 1D) after cat, it might become [M] where M is sum of dims.
+        # It needs to be [Batch, Sum_of_dims]. If batch is 1, then [1, Sum_of_dims].
+        # The unsqueeze(0) above handles the case where the initial individual tensors were 0D or 1D without batch.
+        # If they are already [Batch, Dim], cat will produce [Batch, Sum_of_dims].
 
         cam_embedding = self.camera_vit(camera_img)
         lidar_embedding = self.lidar_vit(lidar_img)
@@ -76,7 +90,7 @@ class DroneModel(nn.Module): # Actor-Critic Model
     def act(self, drone_data_obj, deterministic=False):
         shared_features = self._extract_features(drone_data_obj)
         action_mean = self.actor_head(shared_features)
-        action_std = torch.exp(self.log_std.expand_as(action_mean))
+        action_std = torch.exp(self.log_std.expand_as(action_mean)) # Ensure log_std is expanded correctly
         dist = Normal(action_mean, action_std)
 
         if deterministic:
@@ -84,15 +98,13 @@ class DroneModel(nn.Module): # Actor-Critic Model
         else:
             action = dist.sample()
         
-        log_prob = dist.log_prob(action).sum(axis=-1)
+        log_prob = dist.log_prob(action).sum(axis=-1) # Sum log_probs for multi-dimensional actions
         state_value = self.critic_head(shared_features)
         
+        # Ensure outputs are detached if they are not used for gradient computation directly here
         return action.detach(), log_prob.detach(), state_value.detach()
 
     def evaluate(self, drone_data_obj, action_taken):
-        # This method expects drone_data_obj to potentially be a batch later,
-        # or features to be pre-extracted and batched.
-        # For now, assuming single drone_data_obj for consistency with _extract_features
         shared_features = self._extract_features(drone_data_obj)
         action_mean = self.actor_head(shared_features)
         action_std = torch.exp(self.log_std.expand_as(action_mean))
