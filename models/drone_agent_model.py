@@ -30,14 +30,14 @@ class DroneModel(nn.Module): # Actor-Critic Model
             dilation=original_conv_proj.dilation,
             groups=original_conv_proj.groups,
             bias=(original_conv_proj.bias is not None)
-        )
+        )   
         if original_conv_proj.bias is not None:
             # Initialize bias if it exists
             nn.init.zeros_(self.lidar_vit.conv_proj.bias)
         # Initialize weights (example: Kaiming uniform)
         # For the new conv layer, initialize its weights. 
         # We are not copying mean of weights from original conv_proj, as it might not be optimal for single channel.
-        nn.init.kaiming_uniform_(self.lidar_vit.conv_proj.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
+        nn.init.kaiming_normal_(self.lidar_vit.conv_proj.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
         self.lidar_vit.heads.head = nn.Linear(vit_model_dim, fusion_dim) # Replace the classifier head
 
         self.scalar_processor = nn.Linear(scalar_input_dim, fusion_dim)
@@ -72,6 +72,7 @@ class DroneModel(nn.Module): # Actor-Critic Model
         
         # Ensure scalar inputs are 2D [batch_size, num_features]
         scalar_inputs = torch.cat([gps, accel, gyro, teta], dim=-1).to(device)
+ 
         if scalar_inputs.ndim == 1:
             scalar_inputs = scalar_inputs.unsqueeze(0)
         # If scalar_inputs was [N] (e.g. for accel which is 1D) after cat, it might become [M] where M is sum of dims.
@@ -84,7 +85,9 @@ class DroneModel(nn.Module): # Actor-Critic Model
         scalar_embedding = self.scalar_processor(scalar_inputs)
 
         fused = torch.cat((cam_embedding, lidar_embedding, scalar_embedding), dim=1)
-        shared_features = self.relu(self.fusion_layer(fused))
+ 
+        fusedd = self.fusion_layer(fused)
+        shared_features = self.relu(fusedd)
         return shared_features
 
     def act(self, drone_data_obj, deterministic=False):
@@ -92,13 +95,14 @@ class DroneModel(nn.Module): # Actor-Critic Model
         action_mean = self.actor_head(shared_features)
         action_std = torch.exp(self.log_std.expand_as(action_mean)) # Ensure log_std is expanded correctly
         dist = Normal(action_mean, action_std)
-
         if deterministic:
             action = action_mean
         else:
             action = dist.sample()
+            print(f"Action: {action}")  # Debugging output
         
         log_prob = dist.log_prob(action).sum(axis=-1) # Sum log_probs for multi-dimensional actions
+
         state_value = self.critic_head(shared_features)
         
         # Ensure outputs are detached if they are not used for gradient computation directly here
@@ -109,9 +113,50 @@ class DroneModel(nn.Module): # Actor-Critic Model
         action_mean = self.actor_head(shared_features)
         action_std = torch.exp(self.log_std.expand_as(action_mean))
         dist = Normal(action_mean, action_std)
-
+        
         log_prob = dist.log_prob(action_taken).sum(axis=-1)
         dist_entropy = dist.entropy().sum(axis=-1)
         state_value = self.critic_head(shared_features)
+        
 
         return log_prob, state_value, dist_entropy
+    
+    # if printed it will show the model architecture
+    def __repr__(self):
+        parts = [f"{self.__class__.__name__}("]
+
+        # Camera ViT
+        parts.append(f"  (camera_vit): ViT_B_16 (pretrained)")
+        parts.append(f"    (heads.head): Linear(in_features={self.camera_vit.heads.head.in_features}, out_features={self.camera_vit.heads.head.out_features})")
+
+        # Lidar ViT
+        parts.append(f"  (lidar_vit): ViT_B_16 (pretrained)")
+        parts.append(f"    (conv_proj): Conv2d(in_channels={self.lidar_vit.conv_proj.in_channels}, out_channels={self.lidar_vit.conv_proj.out_channels}, kernel_size={self.lidar_vit.conv_proj.kernel_size}, stride={self.lidar_vit.conv_proj.stride}, padding={self.lidar_vit.conv_proj.padding})")
+        parts.append(f"    (heads.head): Linear(in_features={self.lidar_vit.heads.head.in_features}, out_features={self.lidar_vit.heads.head.out_features})")
+
+        # Scalar Processor
+        parts.append(f"  (scalar_processor): {self.scalar_processor}")
+
+        # Fusion Layer
+        parts.append(f"  (fusion_layer): {self.fusion_layer}")
+        parts.append(f"  (relu): ReLU()")
+
+        # Actor Head
+        actor_head_parts = ["  (actor_head): Sequential("]
+        for i, layer in enumerate(self.actor_head):
+            actor_head_parts.append(f"    ({i}): {layer}")
+        actor_head_parts.append("  )")
+        parts.extend(actor_head_parts)
+
+        # Log Std
+        parts.append(f"  (log_std): Parameter(shape={list(self.log_std.shape)})")
+
+        # Critic Head
+        critic_head_parts = ["  (critic_head): Sequential("]
+        for i, layer in enumerate(self.critic_head):
+            critic_head_parts.append(f"    ({i}): {layer}")
+        critic_head_parts.append("  )")
+        parts.extend(critic_head_parts)
+        
+        parts.append(")")
+        return "\n\n".join(parts)

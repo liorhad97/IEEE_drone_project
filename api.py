@@ -3,14 +3,12 @@ import threading
 import time
 import random # For simulation
 import torch # For simulation data
+from config import hyperparameters as hp # Added import
 
 # Conditional import for SSEClient and requests
-try:
-    from sseclient import SSEClient
-    import requests
-except ImportError:
-    SSEClient = None
-    requests = None
+from sseclient import SSEClient
+import requests
+
 
 class API:
     def __init__(self, 
@@ -45,6 +43,7 @@ class API:
         self.sim_gyro_range = sim_gyro_range
         self.sim_teta_yaw_range = sim_teta_yaw_range
         self.sim_teta_pitch_range = sim_teta_pitch_range
+        # self.img_size = hp.IMG_SIZE # Store image size if needed frequently
         
         self._simulation_last_event_time = time.time()
         self._sim_objective_currently_found = False
@@ -136,7 +135,7 @@ class API:
             self.sse_client_instance = None
             print(f"Live SSE Listener: Thread for stream {self.stream_url} has finished.")
 
-    def get_drone_data(self) -> SensorsData:
+    def get_sensors_data_from_api(self) -> SensorsData: # Renamed from get_drone_data
         if self.simulate:
             # Simulate slight GPS drift
             self._current_simulated_gps[0] += random.uniform(-self.sim_gps_drift_scale, self.sim_gps_drift_scale)
@@ -159,14 +158,32 @@ class API:
                                 ], dtype=torch.float32)
             return SensorsData(gps=gps, accel=accel, gyro=gyro, teta=teta)
         else:
-            # ... (live mode get_drone_data as before) ...
-            print("API: get_drone_data() called in LIVE mode (implementation pending for real hardware). Returning dummy data.")
+            # This is the live mode (not simulating)
+            print("API: get_sensors_data_from_api() called in LIVE mode (implementation pending for real hardware). Returning dummy sensor data.")
             return SensorsData(
                 gps=torch.tensor([0.0,0.0,0.0], dtype=torch.float32), 
                 accel=torch.tensor([0.0], dtype=torch.float32), 
                 gyro=torch.tensor([0.0,0.0,0.0], dtype=torch.float32), 
                 teta=torch.tensor([0.0,0.0], dtype=torch.float32)
             )
+
+    def get_camera_image_from_api(self) -> torch.Tensor:
+        if self.simulate:
+            # print("API: get_camera_image_from_api() called in SIMULATION mode. Returning random image.")
+            return torch.randn(3, hp.IMG_SIZE, hp.IMG_SIZE)
+        else:
+            # This is the live mode (not simulating)
+            print("API: get_camera_image_from_api() called in LIVE mode (implementation pending). Returning placeholder image (zeros).")
+            return torch.zeros(3, hp.IMG_SIZE, hp.IMG_SIZE, dtype=torch.float32)
+
+    def get_lidar_image_from_api(self) -> torch.Tensor:
+        if self.simulate:
+            # print("API: get_lidar_image_from_api() called in SIMULATION mode. Returning random image.")
+            return torch.randn(1, hp.IMG_SIZE, hp.IMG_SIZE)
+        else:
+            # This is the live mode (not simulating)
+            print("API: get_lidar_image_from_api() called in LIVE mode (implementation pending). Returning placeholder image (zeros).")
+            return torch.zeros(1, hp.IMG_SIZE, hp.IMG_SIZE, dtype=torch.float32)
 
     def is_drone_find_objective(self) -> bool:
         return self._objective_found
@@ -196,9 +213,13 @@ if __name__ == '__main__':
     try:
         for i in range(5): 
             print(f"Main Test Loop (Default Sim {i+1}/5): Objective found? {sim_api_default.is_drone_find_objective()}")
-            drone_data = sim_api_default.get_drone_data()
+            drone_data = sim_api_default.get_sensors_data_from_api() # Updated method name
             if drone_data:
                  print(f"  -> Got Drone Data: GPS: {drone_data.gps.tolist()}")
+            # Example of getting images in test
+            # cam_img = sim_api_default.get_camera_image_from_api()
+            # lidar_img = sim_api_default.get_lidar_image_from_api()
+            # print(f"  -> Got Camera Image Shape: {cam_img.shape}, Lidar Image Shape: {lidar_img.shape}")
             time.sleep(3) 
     finally:
         print("--- Main Test Loop: Stopping default simulated API ---")
@@ -219,7 +240,7 @@ if __name__ == '__main__':
     try:
         for i in range(10): 
             print(f"Main Test Loop (Custom Sim {i+1}/10): Objective found? {custom_sim_api.is_drone_find_objective()}")
-            drone_data = custom_sim_api.get_drone_data()
+            drone_data = custom_sim_api.get_sensors_data_from_api() # Updated method name
             if drone_data:
                  print(f"  -> Got Drone Data: GPS: {drone_data.gps.tolist()}, Accel: {drone_data.accel.tolist()}")
             time.sleep(1) 
@@ -237,7 +258,10 @@ if __name__ == '__main__':
     try:
         for i in range(3):
             print(f"Main Test Loop (Live {i+1}/3): Objective found? {live_api.is_drone_find_objective()}")
-            live_data = live_api.get_drone_data() 
+            live_data = live_api.get_sensors_data_from_api() # Updated method name
+            # cam_img_live = live_api.get_camera_image_from_api()
+            # lidar_img_live = live_api.get_lidar_image_from_api()
+            # print(f"  -> Got Live Camera Image Shape: {cam_img_live.shape}, Lidar Image Shape: {lidar_img_live.shape}")
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n--- Main Test Loop: Keyboard interrupt detected (Live) ---")

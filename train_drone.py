@@ -1,24 +1,36 @@
 import torch
-import torch.nn as nn # Ensure nn is imported
-import torch.optim as optim # Import optimizer
+import torch.nn as nn
+import torch.optim as optim
 import time
 from collections import deque
 import random
-import numpy as np # For GAE calculation
+import numpy as np
 
 from data_models.drone_data_model import DroneData
 from models.drone_agent_model import DroneModel
 from config import hyperparameters as hp
-from api import API # Import the API class
-from reword_analasis import Reward # Import the Reward class
+from api import API
+from reword_analasis import Reward
+
+class TestDataGenerator:
+    def __init__(self, device):
+        self.device = device
+
+    def generate_drone_data(self):
+        camera = torch.randn(3, hp.IMG_SIZE, hp.IMG_SIZE, device=self.device)
+        lidar = torch.randn(1, hp.IMG_SIZE, hp.IMG_SIZE, device=self.device)
+        gps = torch.randn(3, device=self.device)
+        accel = torch.tensor([torch.randn(1).item()], device=self.device)
+        gyro = torch.randn(3, device=self.device)
+        teta = torch.randn(2, device=self.device)
+        return DroneData(time.time(), camera, lidar, gps, accel, gyro, teta)
 
 class PPOTrainer:
-    def __init__(self, model: DroneModel, device):
+    def __init__(self, model: DroneModel, device, use_generated_data: bool = True):
         self.model = model.to(device)
         self.device = device
+        self.use_generated_data = use_generated_data
         
-        # Initialize API client and Reward calculator
-        # Ensure SSE_STREAM_URL is correctly set in hyperparameters
         self.api_client = API(stream_url=hp.SSE_STREAM_URL) 
         self.reward_calculator = Reward(
             api_client=self.api_client,
@@ -29,10 +41,12 @@ class PPOTrainer:
             sample_delay=hp.REWARD_SAMPLE_DELAY
         )
 
+        if self.use_generated_data:
+            self.data_generator = TestDataGenerator(device=self.device)
+
         self.actor_optimizer = optim.Adam(self.model.actor_head.parameters(), lr=hp.LEARNING_RATE_ACTOR)
         self.critic_optimizer = optim.Adam(self.model.critic_head.parameters(), lr=hp.LEARNING_RATE_CRITIC)
         
-        # PPO specific storage for rollouts
         self.rollout_buffer = {
             'states': [], 'actions': [], 'log_probs': [], 
             'rewards': [], 'values': [], 'dones': [], 'advantages': [], 'returns': []
@@ -43,18 +57,37 @@ class PPOTrainer:
         for key in self.rollout_buffer:
             self.rollout_buffer[key].clear()
 
-    def _generate_dummy_drone_data(self): # Simulates getting data from environment
-        camera = torch.randn(3, hp.IMG_SIZE, hp.IMG_SIZE, device=self.device)
-        lidar = torch.randn(1, hp.IMG_SIZE, hp.IMG_SIZE, device=self.device)
-        # Scalar data should also be on the correct device and correctly shaped
-        gps = torch.randn(3, device=self.device)
-        accel = torch.tensor([torch.randn(1).item()], device=self.device) # Ensure accel is a 1D tensor
-        gyro = torch.randn(3, device=self.device)
-        teta = torch.randn(2, device=self.device)
-        return DroneData(time.time(), camera, lidar, gps, accel, gyro, teta)
+    def _get_current_drone_data(self):
+        if self.use_generated_data:
+            if hasattr(self, 'data_generator'):
+                return self.data_generator.generate_drone_data()
+            else:
+                print("Error: TestDataGenerator not initialized even though use_generated_data is True. Falling back to dummy data.")
+                temp_data_generator = TestDataGenerator(device=self.device)
+                return temp_data_generator.generate_drone_data()
+        else:
+            print("Fetching real drone data from API...")
+            sensor_data = self.api_client.get_sensors_data_from_api() 
+            camera_image = self.api_client.get_camera_image_from_api().to(self.device) 
+            lidar_image = self.api_client.get_lidar_image_from_api().to(self.device)   
+            
+            if sensor_data and camera_image is not None and lidar_image is not None:
+                return DroneData(
+                    timestamp=time.time(), 
+                    camera_image=camera_image,
+                    lidar_image=lidar_image,
+                    gps_data=sensor_data.gps.to(self.device),
+                    accelerometer_data=sensor_data.accel.to(self.device),
+                    gyroscope_data=sensor_data.gyro.to(self.device),
+                    attitude_data=sensor_data.teta.to(self.device)
+                )
+            else:
+                print("Warning: Failed to fetch complete data from API. Falling back to dummy data generation.")
+                if not hasattr(self, 'data_generator_fallback'):
+                    self.data_generator_fallback = TestDataGenerator(device=self.device)
+                return self.data_generator_fallback.generate_drone_data()
 
     def _compute_gae_and_returns(self, next_value, next_done):
-        # Convert lists to tensors for computation
         rewards = torch.tensor(self.rollout_buffer['rewards'], dtype=torch.float32, device=self.device)
         values = torch.tensor(self.rollout_buffer['values'], dtype=torch.float32, device=self.device)
         dones = torch.tensor(self.rollout_buffer['dones'], dtype=torch.float32, device=self.device)
@@ -76,17 +109,12 @@ class PPOTrainer:
         self.rollout_buffer['returns'] = returns
 
     def train_ppo_epoch(self):
-        # Convert rollout data to tensors
-        # Note: States are DroneData objects, handle them appropriately when batching
-        # For simplicity, we'll assume states can be processed one by one or need a custom collate_fn if batched directly
         old_actions = torch.stack(self.rollout_buffer['actions']).detach()
         old_log_probs = torch.stack(self.rollout_buffer['log_probs']).detach()
         advantages = self.rollout_buffer['advantages'].detach()
         returns = self.rollout_buffer['returns'].detach()
-        # States are kept as a list of DroneData objects
         states_data_list = self.rollout_buffer['states'] 
 
-        # Normalize advantages (optional but often helpful)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         num_samples = len(states_data_list)
@@ -97,20 +125,6 @@ class PPOTrainer:
             for start in range(0, num_samples, hp.PPO_MINI_BATCH_SIZE):
                 end = start + hp.PPO_MINI_BATCH_SIZE
                 minibatch_indices = indices[start:end]
-
-                # Process DroneData objects for the minibatch
-                # This part needs careful handling if you batch DroneData objects directly
-                # For now, let's assume we re-evaluate the model for each state in the minibatch
-                # This is less efficient but simpler to implement without a custom collate_fn
-                
-                # Placeholder for minibatch processing - this needs to be efficient
-                # A better way is to batch the forward pass if possible
-                # For simplicity, this example might be slow due to iterating for new_log_probs, values, entropy
-                
-                # Actor Loss
-                # Re-evaluate actions for the current policy on minibatch states
-                # This is where you'd ideally batch process states_data_list[minibatch_indices]
-                # For simplicity, let's iterate. This is NOT efficient for actual training.
                 new_log_probs_list = []
                 values_list = []
                 entropy_list = []
@@ -121,8 +135,8 @@ class PPOTrainer:
                     entropy_list.append(entropy)
                 
                 new_log_probs = torch.stack(new_log_probs_list)
-                values = torch.stack(values_list).squeeze() # Ensure values is 1D if it comes out as [N,1]
-                entropy = torch.stack(entropy_list).mean() # Mean entropy for the batch
+                values = torch.stack(values_list).squeeze()
+                entropy = torch.stack(entropy_list).mean()
 
                 log_ratio = new_log_probs - old_log_probs[minibatch_indices]
                 ratio = torch.exp(log_ratio)
@@ -130,106 +144,80 @@ class PPOTrainer:
                 surr1 = ratio * advantages[minibatch_indices]
                 surr2 = torch.clamp(ratio, 1.0 - hp.CLIP_EPSILON, 1.0 + hp.CLIP_EPSILON) * advantages[minibatch_indices]
                 actor_loss = -torch.min(surr1, surr2).mean()
-
-                # Critic Loss
-                # Ensure values and returns[minibatch_indices] are correctly shaped for MSELoss
-                # values should be [minibatch_size], returns[minibatch_indices] should be [minibatch_size]
+                    
                 critic_loss = nn.MSELoss()(values, returns[minibatch_indices])
 
-                # Total Loss
                 loss = actor_loss + hp.CRITIC_LOSS_COEFF * critic_loss - hp.ENTROPY_COEFF * entropy
 
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
                 loss.backward()
-                # Gradient clipping (optional but often helpful)
-                # nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 self.actor_optimizer.step()
                 self.critic_optimizer.step()
         
-        # Return average losses for logging, if needed
-        # For simplicity, not calculating average losses here, but you might want to.
         return actor_loss.item(), critic_loss.item(), entropy.item()
 
     def run_training_loop(self):
         print(f"Starting PPO training on {self.device}...")
-        self.model.train() # Set model to training mode
+        self.model.train()
         
-        # Initial state (dummy for now, replace with actual environment interaction)
-        current_drone_state = self._generate_dummy_drone_data()
+        current_drone_state = self._get_current_drone_data()
 
         for step in range(hp.MAX_TRAINING_STEPS):
             self.current_step = step
             
-            # Collect ROLLOUT_LENGTH transitions
             for _ in range(hp.ROLLOUT_LENGTH):
                 with torch.no_grad():
                     action, log_prob, value = self.model.act(current_drone_state)
-                
-                # Simulate environment step: get next_state, reward, done
-                # This is where you interact with your drone environment/API
-                # For now, using dummy data and reward calculation
-                next_drone_state = self._generate_dummy_drone_data() # Simulate next state
-                reward = self.reward_calculator.get_reward() # Get reward from your Reward class
-                done = self.api_client.is_drone_find_objective() # Check if objective found (episode ends)
-                # Or, done might be true if max episode length is reached, etc.
 
-                # Store transition
+                next_drone_state = self._get_current_drone_data()
+                reward = self.reward_calculator.get_reward()
+                done = self.api_client.is_drone_find_objective()
+
                 self.rollout_buffer['states'].append(current_drone_state)
-                self.rollout_buffer['actions'].append(action.squeeze()) # Ensure action is stored correctly
+                self.rollout_buffer['actions'].append(action.squeeze())
                 self.rollout_buffer['log_probs'].append(log_prob)
                 self.rollout_buffer['rewards'].append(reward)
-                self.rollout_buffer['values'].append(value.squeeze()) # Ensure value is scalar
+                self.rollout_buffer['values'].append(value.squeeze())
                 self.rollout_buffer['dones'].append(done)
                 
                 current_drone_state = next_drone_state
                 if done:
-                    # If episode ends, reset environment and get new initial state
-                    # For dummy data, just regenerate. In a real env, this means a reset call.
                     print(f"Objective found or episode ended at step {step}. Resetting.")
-                    current_drone_state = self._generate_dummy_drone_data()
-                    # Potentially break from rollout collection if an episode ends early
-                    # and handle partial rollouts, or ensure rollouts are always full.
-                    # For simplicity, we continue filling the rollout buffer here.
+                    current_drone_state = self._get_current_drone_data()
             
-            # Compute GAE and returns for the collected rollout
             with torch.no_grad():
-                _, _, next_value = self.model.act(current_drone_state) # Value of the last state in rollout
+                _, _, next_value = self.model.act(current_drone_state)
             next_done_tensor = torch.tensor([float(self.api_client.is_drone_find_objective())], device=self.device)
             self._compute_gae_and_returns(next_value.squeeze(), next_done_tensor)
             
-            # Train PPO for PPO_EPOCHS using the collected rollout data
             actor_loss, critic_loss, entropy = self.train_ppo_epoch()
             
-            # Clear rollout buffer for next iteration
             self._clear_rollout_buffer()
             
-            if step % 10 == 0: # Log progress periodically
+            if step % 10 == 0:
                 print(f"Step: {step}/{hp.MAX_TRAINING_STEPS}, Actor Loss: {actor_loss:.4f}, Critic Loss: {critic_loss:.4f}, Entropy: {entropy:.4f}")
 
         print("Training finished.")
-        # Save the model (optional)
-        # torch.save(self.model.state_dict(), "ppo_drone_model.pth")
-        # self.api_client.stop_listening() # Clean up API client listener
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Ensure hyperparameters are loaded, especially scalar_input_dim and num_control_outputs
     model = DroneModel(
         fusion_dim=hp.FUSION_DIM,
-        scalar_input_dim=hp.SCALAR_INPUT_DIM, # Make sure this matches your DroneData scalar components
+        scalar_input_dim=hp.SCALAR_INPUT_DIM,
         vit_image_size=hp.IMG_SIZE,
         vit_patch_size=hp.VIT_PATCH_SIZE,
         num_control_outputs=hp.NUM_CONTROL_OUTPUTS
     ).to(device)
+    print(model)
     
-    trainer = PPOTrainer(model, device)
+    trainer = PPOTrainer(model, device, use_generated_data=True)
     try:
         trainer.run_training_loop()
     except KeyboardInterrupt:
         print("Training interrupted by user.")
     finally:
         if hasattr(trainer, 'api_client') and trainer.api_client:
-            trainer.api_client.stop_listening() # Ensure SSE listener is stopped
+            trainer.api_client.stop_listening()
         print("Cleanup complete.")

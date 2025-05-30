@@ -18,9 +18,9 @@ class Reward:
             return -1.0  # Penalty if no data points
         
         # Extract data into tensors efficiently
-        accel_tensor = torch.tensor([data.accel for data in data_points])
-        gyro_tensor = torch.tensor([data.gyro for data in data_points])
-        teta_tensor = torch.tensor([data.teta for data in data_points])
+        accel_tensor = torch.stack([data.accel for data in data_points])
+        gyro_tensor = torch.stack([data.gyro for data in data_points])
+        teta_tensor = torch.stack([data.teta for data in data_points])
         
         # Calculate deviations in one step
         accel_deviation = torch.std(accel_tensor).item()
@@ -52,6 +52,16 @@ class Reward:
             return 30
         else:
             return 0
+        
+    def get_reward_people_aspect(self, data_points): # data_points unused, kept for signature consistency
+        """Calculate reward based on the number of people detected"""
+        # Uses the API client instance
+        if not self.api_client:
+            print("Reward Error: API client not initialized in Reward class.")
+            return 0.0
+        num_people = self.api_client.get_num_people()
+        if num_people > 0:
+            return num_people * 1
 
     def get_reward(self): # Removed unused drone_data parameter
         """Calculate the total reward based on multiple aspects"""
@@ -85,6 +95,7 @@ class Reward:
         sensors_reward = self.get_reward_sensors_aspect(data_points)
         time_reward = self.get_reward_time_aspect(data_points)
         target_reward = self.get_reward_find_target_aspect(data_points)
+        people_reward = self.get_reward_people_aspect(data_points)
 
-        total_reward = sensors_reward + time_reward + target_reward
+        total_reward = sensors_reward + time_reward + target_reward + people_reward
         return total_reward
