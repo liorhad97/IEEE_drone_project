@@ -8,17 +8,26 @@ class DroneModel(nn.Module): # Actor-Critic Model
                  num_control_outputs, vit_model_dim=768): # Removed learning_rate
         super(DroneModel, self).__init__()
 
+        # Input normalization parameters (learnable)
+        self.register_buffer('scalar_mean', torch.zeros(scalar_input_dim))
+        self.register_buffer('scalar_std', torch.ones(scalar_input_dim))
+        
         # --- Shared Feature Extraction Backbone ---
+        # Use ViT but smaller and with more frozen layers for efficiency
         self.camera_vit = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT)
-        # Freeze parameters of the pre-trained ViT
-        # for param in self.camera_vit.parameters():
-        #     param.requires_grad = False
+        # Freeze parameters of the pre-trained ViT - most layers should be frozen
+        for name, param in self.camera_vit.named_parameters():
+            # Only keep the last few transformer blocks trainable
+            if 'blocks.11' not in name and 'heads' not in name:
+                param.requires_grad = False
         self.camera_vit.heads.head = nn.Linear(vit_model_dim, fusion_dim) # Replace the classifier head
         
         self.lidar_vit = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT)
         # Freeze parameters of the pre-trained ViT
-        # for param in self.lidar_vit.parameters():
-        #    param.requires_grad = False
+        for name, param in self.lidar_vit.named_parameters():
+            # Only keep the last few transformer blocks trainable
+            if 'blocks.11' not in name and 'heads' not in name:
+                param.requires_grad = False
             
         original_conv_proj = self.lidar_vit.conv_proj
         self.lidar_vit.conv_proj = nn.Conv2d(
@@ -43,21 +52,31 @@ class DroneModel(nn.Module): # Actor-Critic Model
         self.scalar_processor = nn.Linear(scalar_input_dim, fusion_dim)
         # Adjusted fusion_layer input to match the sum of individual fusion_dims
         self.fusion_layer = nn.Linear(fusion_dim * 3, vit_model_dim) # Assuming fusion_dim for each of 3 modalities
+        self.fusion_layer_2 = nn.Linear(vit_model_dim, vit_model_dim) # Added layer
+        self.fusion_layer_3 = nn.Linear(vit_model_dim, vit_model_dim) # Added another layer
         self.relu = nn.ReLU()
-
+        
         # --- Actor Head (Policy) ---
         self.actor_head = nn.Sequential(
             nn.Linear(vit_model_dim, vit_model_dim // 2),
             nn.ReLU(),
+            nn.Linear(vit_model_dim // 2, vit_model_dim // 2), 
+            nn.ReLU(), 
+            nn.Linear(vit_model_dim // 2, vit_model_dim // 2), # Added another layer
+            nn.ReLU(), # Added activation
             nn.Linear(vit_model_dim // 2, num_control_outputs) # Outputs mean of the action distribution
         )
-        # Learnable log standard deviation for the action distribution
-        self.log_std = nn.Parameter(torch.zeros(num_control_outputs))
+        # Learnable log standard deviation for the action distribution with better initialization
+        self.log_std = nn.Parameter(torch.ones(num_control_outputs) * -0.5)  # Start with smaller stdev
 
         # --- Critic Head (Value Function) ---
         self.critic_head = nn.Sequential(
             nn.Linear(vit_model_dim, vit_model_dim // 2),
             nn.ReLU(),
+            nn.Linear(vit_model_dim // 2, vit_model_dim // 2), 
+            nn.ReLU(), 
+            nn.Linear(vit_model_dim // 2, vit_model_dim // 2), # Added another layer
+            nn.ReLU(), # Added activation
             nn.Linear(vit_model_dim // 2, 1) # Outputs a single value for the state
         )
 
@@ -67,19 +86,35 @@ class DroneModel(nn.Module): # Actor-Critic Model
         device = next(self.parameters()).device
         
         # Add batch dimension if not present (assuming single instance processing for now)
-        camera_img = camera_img.to(device).unsqueeze(0) if camera_img.ndim == 3 else camera_img.to(device)
-        lidar_img = lidar_img.to(device).unsqueeze(0) if lidar_img.ndim == 3 else lidar_img.to(device)
+        if camera_img.dim() == 3:
+            camera_img = camera_img.unsqueeze(0)
+        if lidar_img.dim() == 3:
+            lidar_img = lidar_img.unsqueeze(0)
+            
+        # For scalar inputs, ensure they all have the same dimensions before concatenating
+        scalar_inputs = [t.float() for t in [gps, accel, gyro, teta]]
         
-        # Ensure scalar inputs are 2D [batch_size, num_features]
-        scalar_inputs = torch.cat([gps, accel, gyro, teta], dim=-1).to(device)
- 
-        if scalar_inputs.ndim == 1:
-            scalar_inputs = scalar_inputs.unsqueeze(0)
-        # If scalar_inputs was [N] (e.g. for accel which is 1D) after cat, it might become [M] where M is sum of dims.
-        # It needs to be [Batch, Sum_of_dims]. If batch is 1, then [1, Sum_of_dims].
-        # The unsqueeze(0) above handles the case where the initial individual tensors were 0D or 1D without batch.
-        # If they are already [Batch, Dim], cat will produce [Batch, Sum_of_dims].
-
+        # Add batch dimension if not present
+        scalar_inputs = [s.unsqueeze(0) if s.dim() == 1 else s for s in scalar_inputs]
+            
+        # Concatenate scalar inputs along dimension 1 (feature dimension)
+        scalar_inputs = torch.cat(scalar_inputs, dim=1)
+        
+        # Apply input normalization to scalar data (running average)
+        with torch.no_grad():
+            if self.training:
+                # Update normalization parameters during training
+                batch_mean = scalar_inputs.mean(dim=0) if scalar_inputs.size(0) > 1 else scalar_inputs[0]
+                batch_std = scalar_inputs.std(dim=0) + 1e-8 if scalar_inputs.size(0) > 1 else torch.ones_like(scalar_inputs[0])
+                
+                # Exponential moving average updates for mean and std
+                momentum = 0.01
+                self.scalar_mean = (1 - momentum) * self.scalar_mean + momentum * batch_mean
+                self.scalar_std = (1 - momentum) * self.scalar_std + momentum * batch_std
+        
+        # Normalize scalar inputs
+        scalar_inputs = (scalar_inputs - self.scalar_mean) / self.scalar_std
+        
         cam_embedding = self.camera_vit(camera_img)
         lidar_embedding = self.lidar_vit(lidar_img)
         scalar_embedding = self.scalar_processor(scalar_inputs)
@@ -87,19 +122,30 @@ class DroneModel(nn.Module): # Actor-Critic Model
         fused = torch.cat((cam_embedding, lidar_embedding, scalar_embedding), dim=1)
  
         fusedd = self.fusion_layer(fused)
-        shared_features = self.relu(fusedd)
+        fusedd = self.relu(fusedd) # Activation for first fusion layer
+        fusedd = self.fusion_layer_2(fusedd) # Pass through second fusion layer
+        fusedd = self.relu(fusedd) # Activation for second fusion layer
+        fusedd = self.fusion_layer_3(fusedd) # Pass through third fusion layer
+        shared_features = self.relu(fusedd) # Activation for third fusion layer
         return shared_features
 
     def act(self, drone_data_obj, deterministic=False):
         shared_features = self._extract_features(drone_data_obj)
         action_mean = self.actor_head(shared_features)
-        action_std = torch.exp(self.log_std.expand_as(action_mean)) # Ensure log_std is expanded correctly
+        # Clamp action means to prevent extreme values
+        action_mean = torch.tanh(action_mean)  # Constrain to [-1, 1]
+        
+        # Get action standard deviation with minimum value to prevent collapse
+        action_std = torch.exp(self.log_std.expand_as(action_mean)).clamp(min=1e-3, max=1.0)
+        
         dist = Normal(action_mean, action_std)
         if deterministic:
             action = action_mean
         else:
             action = dist.sample()
-            print(f"Action: {action}")  # Debugging output
+            # Limit debugging output to not overwhelm logs
+            if torch.rand(1).item() < 0.01:  # Only print occasionally
+                print(f"Action mean: {action_mean.detach().cpu().numpy()}, std: {action_std.detach().cpu().numpy()}")
         
         log_prob = dist.log_prob(action).sum(axis=-1) # Sum log_probs for multi-dimensional actions
 

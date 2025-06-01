@@ -4,3 +4,4 @@ einops
 torchvision
 datasets
 trl
+matplotlib

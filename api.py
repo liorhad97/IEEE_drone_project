@@ -137,25 +137,43 @@ class API:
 
     def get_sensors_data_from_api(self) -> SensorsData: # Renamed from get_drone_data
         if self.simulate:
-            # Simulate slight GPS drift
-            self._current_simulated_gps[0] += random.uniform(-self.sim_gps_drift_scale, self.sim_gps_drift_scale)
-            self._current_simulated_gps[1] += random.uniform(-self.sim_gps_drift_scale, self.sim_gps_drift_scale)
-            self._current_simulated_gps[2] += random.uniform(-self.sim_gps_drift_scale * 100, self.sim_gps_drift_scale * 100) # Altitude drift can be larger
+            # Simulate slight GPS drift using Gaussian distribution
+            gps_drift_sigma = self.sim_gps_drift_scale / 3.0
+            gps_altitude_drift_sigma = (self.sim_gps_drift_scale * 100) / 3.0
+            
+            self._current_simulated_gps[0] += random.gauss(0, gps_drift_sigma)
+            self._current_simulated_gps[1] += random.gauss(0, gps_drift_sigma)
+            self._current_simulated_gps[2] += random.gauss(0, gps_altitude_drift_sigma)
             
             # Keep altitude somewhat bounded around its initial z component
             if not (self.sim_gps_center[2] - 5 < self._current_simulated_gps[2] < self.sim_gps_center[2] + 5):
-                 self._current_simulated_gps[2] = self.sim_gps_center[2] + random.uniform(-0.5, 0.5) # Reset with small variation
+                 # Reset with small Gaussian variation around center
+                 self._current_simulated_gps[2] = self.sim_gps_center[2] + random.gauss(0, 1.0/6.0) 
 
             gps = torch.tensor(self._current_simulated_gps, dtype=torch.float32)
             
-            accel = torch.tensor([random.uniform(self.sim_accel_range[0], self.sim_accel_range[1])], dtype=torch.float32)
-            gyro = torch.tensor([random.uniform(self.sim_gyro_range[0], self.sim_gyro_range[1]),
-                                 random.uniform(self.sim_gyro_range[0], self.sim_gyro_range[1]),
-                                 random.uniform(self.sim_gyro_range[0], self.sim_gyro_range[1])
-                                ], dtype=torch.float32)
-            teta = torch.tensor([random.uniform(self.sim_teta_yaw_range[0], self.sim_teta_yaw_range[1]),
-                                 random.uniform(self.sim_teta_pitch_range[0], self.sim_teta_pitch_range[1])
-                                ], dtype=torch.float32)
+            # Accel simulation with Gaussian distribution
+            accel_mu = (self.sim_accel_range[0] + self.sim_accel_range[1]) / 2.0
+            accel_sigma = (self.sim_accel_range[1] - self.sim_accel_range[0]) / 6.0
+            accel_val = random.gauss(accel_mu, accel_sigma if accel_sigma > 0 else 0.001) # ensure sigma > 0
+            accel = torch.tensor([accel_val], dtype=torch.float32)
+            
+            # Gyro simulation with Gaussian distribution
+            gyro_mu = (self.sim_gyro_range[0] + self.sim_gyro_range[1]) / 2.0
+            gyro_sigma = (self.sim_gyro_range[1] - self.sim_gyro_range[0]) / 6.0
+            gyro_vals = [random.gauss(gyro_mu, gyro_sigma if gyro_sigma > 0 else 0.001) for _ in range(3)]
+            gyro = torch.tensor(gyro_vals, dtype=torch.float32)
+            
+            # Teta simulation with Gaussian distribution
+            yaw_mu = (self.sim_teta_yaw_range[0] + self.sim_teta_yaw_range[1]) / 2.0
+            yaw_sigma = (self.sim_teta_yaw_range[1] - self.sim_teta_yaw_range[0]) / 6.0
+            pitch_mu = (self.sim_teta_pitch_range[0] + self.sim_teta_pitch_range[1]) / 2.0
+            pitch_sigma = (self.sim_teta_pitch_range[1] - self.sim_teta_pitch_range[0]) / 6.0
+            
+            teta_yaw = random.gauss(yaw_mu, yaw_sigma if yaw_sigma > 0 else 0.001)
+            teta_pitch = random.gauss(pitch_mu, pitch_sigma if pitch_sigma > 0 else 0.001)
+            teta = torch.tensor([teta_yaw, teta_pitch], dtype=torch.float32)
+            
             return SensorsData(gps=gps, accel=accel, gyro=gyro, teta=teta)
         else:
             # This is the live mode (not simulating)
@@ -184,6 +202,24 @@ class API:
             # This is the live mode (not simulating)
             print("API: get_lidar_image_from_api() called in LIVE mode (implementation pending). Returning placeholder image (zeros).")
             return torch.zeros(1, hp.IMG_SIZE, hp.IMG_SIZE, dtype=torch.float32)
+
+    def get_num_people(self) -> int:
+        """Simulates detecting a number of people using a Gaussian-like distribution."""
+        if self.simulate:
+            if self._objective_found: # More likely to see people if objective is 'found'
+                # Target mean around 1.5-2, range 0-3
+                mu, sigma = 1.5, 0.8 
+                value = round(random.gauss(mu, sigma))
+                return max(0, min(3, int(value)))
+            else:
+                # Target mean around 0.5, range 0-1
+                mu, sigma = 0.5, 0.4
+                value = round(random.gauss(mu, sigma))
+                return max(0, min(1, int(value)))
+        else:
+            # Placeholder for live mode
+            print("API: get_num_people() called in LIVE mode (implementation pending). Returning 0.")
+            return 0
 
     def is_drone_find_objective(self) -> bool:
         return self._objective_found
